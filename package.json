@@ -1,8 +1,8 @@
 {
   "name": "inventario-upq",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "private": true,
-  "description": "Sistema local de inventario, préstamos y adeudos UPQ",
+  "description": "Sistema UPQ: solicitudes, préstamos, devoluciones, historial y gestión de cuentas",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"

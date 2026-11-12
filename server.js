@@ -109,15 +109,10 @@ async function init(){
   if(!one("SELECT id FROM users WHERE registration='admin'")){
     db.run("INSERT INTO users(full_name,registration,role,status,password_hash) VALUES(?,?,?,?,?)",
       ["Administrador UPQ","admin","admin","activo",bcrypt.hashSync(ADMIN_PASSWORD,10)]);
-  } else {
-    db.run("UPDATE users SET password_hash=? WHERE registration='admin'",[bcrypt.hashSync(ADMIN_PASSWORD,10)]);
   }
   if(!one("SELECT id FROM users WHERE registration=?",[SHARED_USER])){
     db.run("INSERT INTO users(full_name,registration,role,status,career,password_hash) VALUES(?,?,?,?,?,?)",
       ["Usuario UPQ",SHARED_USER,"C","activo","Comunidad UPQ",bcrypt.hashSync(USER_PASSWORD,10)]);
-  } else {
-    db.run("UPDATE users SET full_name=?,role='C',status='activo',password_hash=? WHERE registration=?",
-      ["Usuario UPQ",bcrypt.hashSync(USER_PASSWORD,10),SHARED_USER]);
   }
   saveDb();
 }
@@ -139,15 +134,28 @@ app.post("/api/login",wrap(async(req,res)=>{
   const u=one("SELECT * FROM users WHERE registration=?",[lookup]);
   let ok=false;
   if(u && u.status==="activo"){
-    if(u.role==="admin") ok=password===ADMIN_PASSWORD;
-    else if(u.registration===SHARED_USER) ok=password===USER_PASSWORD;
-    else ok=password===USER_PASSWORD;
+    if(u.password_hash) ok=bcrypt.compareSync(password,u.password_hash);
+    else {
+      const legacyDefault=u.role==="admin"?ADMIN_PASSWORD:USER_PASSWORD;
+      ok=password===legacyDefault;
+      if(ok) run("UPDATE users SET password_hash=? WHERE id=?",[bcrypt.hashSync(password,10),u.id]);
+    }
   }
   if(!ok) return res.status(401).json({error:"Usuario o contraseña incorrectos, o cuenta inactiva."});
   const token=jwt.sign({id:u.id},JWT_SECRET,{expiresIn:"12h"});
   res.json({token,user:{id:u.id,name:u.full_name,registration:u.registration,role:u.role,career:u.career}});
 }));
 app.get("/api/me",auth,(req,res)=>res.json({user:req.user}));
+app.post("/api/change-password",auth,(req,res)=>{
+  const current=String(req.body.current_password||""), next=String(req.body.new_password||""), confirm=String(req.body.confirm_password||"");
+  const user=one("SELECT password_hash FROM users WHERE id=?",[req.user.id]);
+  if(!user?.password_hash || !bcrypt.compareSync(current,user.password_hash)) return res.status(400).json({error:"La contraseña actual es incorrecta."});
+  if(next.length<8) return res.status(400).json({error:"La nueva contraseña debe tener al menos 8 caracteres."});
+  if(next!==confirm) return res.status(400).json({error:"La confirmación no coincide."});
+  if(next===current) return res.status(400).json({error:"La nueva contraseña debe ser diferente a la actual."});
+  run("UPDATE users SET password_hash=? WHERE id=?",[bcrypt.hashSync(next,10),req.user.id]);
+  res.json({message:"Contraseña actualizada correctamente."});
+});
 
 app.get("/api/dashboard",auth,(req,res)=>{
   const inventory=one("SELECT COUNT(*) materials,COALESCE(SUM(quantity_total),0) units,COALESCE(SUM(quantity_available),0) available FROM inventory WHERE active=1");
@@ -161,14 +169,14 @@ app.get("/api/inventory",auth,(req,res)=>{
   const q=`%${req.query.q||""}%`, warehouse=`%${req.query.warehouse||""}%`;
   res.json(rows("SELECT * FROM inventory WHERE active=1 AND name LIKE ? AND warehouse LIKE ? ORDER BY warehouse,name",[q,warehouse]));
 });
-app.post("/api/inventory",auth,allow("admin","A"),(req,res)=>{
+app.post("/api/inventory",auth,allow("admin"),(req,res)=>{
   const {name,warehouse,location,quantity,image_url}=req.body, n=Number(quantity);
   if(!name||!warehouse||!location||!Number.isInteger(n)||n<0) return res.status(400).json({error:"Completa herramienta, almacén, ubicación y cantidad válida."});
   const r=run("INSERT INTO inventory(name,warehouse,location,quantity_total,quantity_available,image_url) VALUES(?,?,?,?,?,?)",[name,warehouse,location,n,n,image_url||"/assets/tool.svg"]);
   run("INSERT INTO movements(inventory_id,type,quantity,notes,actor_id) VALUES(?,?,?,?,?)",[r.id,"alta",n,"Alta de material",req.user.id]);
   res.status(201).json({message:"Material agregado."});
 });
-app.post("/api/inventory/:id/movement",auth,allow("admin","A"),(req,res)=>{
+app.post("/api/inventory/:id/movement",auth,allow("admin"),(req,res)=>{
   const type=req.body.type, n=Number(req.body.quantity), item=one("SELECT * FROM inventory WHERE id=? AND active=1",[req.params.id]);
   if(!item||!["alta","baja"].includes(type)||!Number.isInteger(n)||n<1) return res.status(400).json({error:"Movimiento o cantidad inválida."});
   if(type==="baja"&&(item.quantity_available<n||item.quantity_total<n)) return res.status(400).json({error:"No puedes dar de baja más unidades que las existencias físicas disponibles."});
@@ -179,28 +187,32 @@ app.post("/api/inventory/:id/movement",auth,allow("admin","A"),(req,res)=>{
   });
   res.json({message:`Movimiento de ${type} registrado.`});
 });
-app.get("/api/movements",auth,allow("admin","A"),(req,res)=>{
+app.get("/api/movements",auth,allow("admin"),(req,res)=>{
   res.json(rows(`SELECT m.*,i.name,i.warehouse,u.full_name actor FROM movements m JOIN inventory i ON i.id=m.inventory_id LEFT JOIN users u ON u.id=m.actor_id ORDER BY m.created_at DESC LIMIT 300`));
 });
 
 app.get("/api/users",auth,allow("admin"),(req,res)=>res.json(rows("SELECT id,full_name,registration,email,role,status,career,created_at FROM users ORDER BY full_name")));
 app.post("/api/users",auth,allow("admin"),(req,res)=>{
   const {full_name,registration,email,role,career}=req.body;
-  if(!full_name||!registration||!["A","B","C","admin"].includes(role)) return res.status(400).json({error:"Completa nombre, matrícula/usuario y rol."});
+  const normalizedRole=["A","B","operador"].includes(role)?"operador":role;
+  if(!full_name||!registration||!["operador","C","admin"].includes(normalizedRole)) return res.status(400).json({error:"Completa nombre, matrícula/usuario y rol."});
   if(one("SELECT id FROM users WHERE registration=?",[registration])) return res.status(409).json({error:"Esa matrícula/usuario ya existe."});
-  run("INSERT INTO users(full_name,registration,email,role,status,career) VALUES(?,?,?,?,?,?)",[full_name,registration,email||null,role,"activo",career||null]);
-  res.status(201).json({message:"Usuario creado. Contraseña fija asignada según su tipo de cuenta."});
+  const initialPassword=normalizedRole==="admin"?ADMIN_PASSWORD:USER_PASSWORD;
+  run("INSERT INTO users(full_name,registration,email,role,status,career,password_hash) VALUES(?,?,?,?,?,?,?)",[full_name,registration,email||null,normalizedRole,"activo",career||null,bcrypt.hashSync(initialPassword,10)]);
+  res.status(201).json({message:"Usuario creado. Puede cambiar su contraseña desde Mi cuenta."});
 });
 app.patch("/api/users/:id",auth,allow("admin"),(req,res)=>{
   const {role,status}=req.body;
-  if(role&&!["A","B","C","admin"].includes(role)) return res.status(400).json({error:"Nivel no válido."});
+  const normalizedRole=["A","B","operador"].includes(role)?"operador":role;
+  if(role&&!["operador","C","admin"].includes(normalizedRole)) return res.status(400).json({error:"Nivel no válido."});
   if(status&&!["activo","baja"].includes(status)) return res.status(400).json({error:"Estatus no válido."});
-  run("UPDATE users SET role=COALESCE(?,role),status=COALESCE(?,status) WHERE id=?",[role||null,status||null,req.params.id]);
+  run("UPDATE users SET role=COALESCE(?,role),status=COALESCE(?,status) WHERE id=?",[normalizedRole||null,status||null,req.params.id]);
   res.json({message:"Usuario actualizado."});
 });
 
 app.post("/api/requests",auth,(req,res)=>{
-  const items=Array.isArray(req.body.items)?req.body.items:[], {career,due_date,notes,requester_name,requester_registration,teacher_name}=req.body;
+  const items=Array.isArray(req.body.items)?req.body.items:[], {career,notes,requester_name,requester_registration,teacher_name}=req.body;
+  const due_date=new Date(Date.now()-6*60*60*1000).toISOString().slice(0,10);
   const personName=String(requester_name|| (req.user.registration===SHARED_USER?"":req.user.full_name)).trim();
   const personRegistration=String(requester_registration|| (req.user.registration===SHARED_USER?"":req.user.registration)).trim();
   const teacher=String(teacher_name||"").trim(), area=String(career||req.user.career||"").trim();
@@ -221,7 +233,6 @@ app.post("/api/requests",auth,(req,res)=>{
   res.status(201).json({message:"Solicitud registrada.",folio,id:requestId});
 });
 app.get("/api/requests",auth,(req,res)=>{
-  if(req.user.role==="C" && req.user.registration===SHARED_USER) return res.json([]);
   const q=`%${req.query.q||""}%`;
   let sql=`SELECT r.*,COALESCE(r.requester_name,u.full_name) full_name,
     COALESCE(r.requester_registration,u.registration) registration,u.role,
@@ -234,7 +245,7 @@ app.get("/api/requests",auth,(req,res)=>{
   sql+=" GROUP BY r.id ORDER BY r.requested_at DESC";
   res.json(rows(sql,params));
 });
-app.post("/api/requests/:id/approve",auth,allow("admin","A"),(req,res)=>{
+app.post("/api/requests/:id/approve",auth,allow("admin"),(req,res)=>{
   const r=one("SELECT * FROM requests WHERE id=?",[req.params.id]);
   if(!r||r.status!=="pendiente") return res.status(400).json({error:"La solicitud no está pendiente."});
   const its=rows("SELECT * FROM request_items WHERE request_id=?",[r.id]);
@@ -248,12 +259,12 @@ app.post("/api/requests/:id/approve",auth,allow("admin","A"),(req,res)=>{
   });
   res.json({message:"Préstamo aprobado y existencias descontadas."});
 });
-app.post("/api/requests/:id/reject",auth,allow("admin","A"),(req,res)=>{
+app.post("/api/requests/:id/reject",auth,allow("admin"),(req,res)=>{
   const r=one("SELECT * FROM requests WHERE id=? AND status='pendiente'",[req.params.id]);
   if(!r)return res.status(404).json({error:"Solicitud no encontrada."});
   run("UPDATE requests SET status='rechazada' WHERE id=?",[r.id]);res.json({message:"Solicitud rechazada."});
 });
-app.get("/api/loans",auth,allow("admin","A","B"),(req,res)=>{
+app.get("/api/loans",auth,allow("admin"),(req,res)=>{
   const q=`%${req.query.q||""}%`;
   res.json(rows(`SELECT r.id,r.folio,r.requested_at,r.due_date,r.status,u.full_name,u.registration,
     GROUP_CONCAT(i.name || ' × ' || (ri.quantity-ri.returned_quantity),' · ') materials
@@ -261,7 +272,7 @@ app.get("/api/loans",auth,allow("admin","A","B"),(req,res)=>{
     WHERE r.status='prestamo_activo' AND (COALESCE(r.requester_name,u.full_name) LIKE ? OR COALESCE(r.requester_registration,u.registration) LIKE ?)
     GROUP BY r.id ORDER BY r.requested_at DESC`,[q,q]));
 });
-app.get("/api/returns",auth,allow("admin","A","B"),(req,res)=>{
+app.get("/api/returns",auth,allow("admin"),(req,res)=>{
   const q=`%${req.query.q||""}%`;
   res.json(rows(`SELECT r.id,r.folio,r.due_date,r.teacher_name,r.delivered_at,r.return_started_at,r.return_completed_at,COALESCE(r.requester_name,u.full_name) full_name,COALESCE(r.requester_registration,u.registration) registration,
     GROUP_CONCAT(i.name || ' × ' || (ri.quantity-ri.returned_quantity),' · ') materials
@@ -269,17 +280,17 @@ app.get("/api/returns",auth,allow("admin","A","B"),(req,res)=>{
     WHERE r.status='prestamo_activo' AND ri.returned_quantity<ri.quantity AND (COALESCE(r.requester_name,u.full_name) LIKE ? OR COALESCE(r.requester_registration,u.registration) LIKE ?)
     GROUP BY r.id ORDER BY r.due_date`,[q,q]));
 });
-app.post("/api/returns/:id/start",auth,allow("admin","A"),(req,res)=>{
+app.post("/api/returns/:id/start",auth,allow("admin"),(req,res)=>{
   const request=one("SELECT id,status FROM requests WHERE id=? AND status='prestamo_activo'",[req.params.id]);
   if(!request) return res.status(404).json({error:"Préstamo activo no encontrado."});
   run("UPDATE requests SET return_started_at=CASE WHEN return_completed_at IS NULL THEN COALESCE(return_started_at,CURRENT_TIMESTAMP) ELSE CURRENT_TIMESTAMP END,return_completed_at=NULL WHERE id=?",[request.id]);
   res.json({message:"Se registró la hora de entrada de la devolución."});
 });
-app.get("/api/returns/:id/items",auth,allow("admin","A","B"),(req,res)=>{
+app.get("/api/returns/:id/items",auth,allow("admin"),(req,res)=>{
   res.json(rows(`SELECT ri.id item_id,ri.quantity,ri.returned_quantity,ri.quantity-ri.returned_quantity remaining,i.name,i.id inventory_id
     FROM request_items ri JOIN inventory i ON i.id=ri.inventory_id WHERE ri.request_id=? AND ri.returned_quantity<ri.quantity ORDER BY i.name`,[req.params.id]));
 });
-app.post("/api/returns/:id",auth,allow("admin","A"),(req,res)=>{
+app.post("/api/returns/:id",auth,allow("admin"),(req,res)=>{
   const items=Array.isArray(req.body.items)?req.body.items:[];
   if(!items.length) return res.status(400).json({error:"Marca al menos un material que se recibió."});
   const request=one("SELECT * FROM requests WHERE id=? AND status='prestamo_activo'",[req.params.id]);
@@ -304,7 +315,7 @@ app.post("/api/returns/:id",auth,allow("admin","A"),(req,res)=>{
   });
   res.json({message:"Devolución parcial o completa registrada. Las existencias y adeudos fueron actualizados."});
 });
-app.get("/api/history",auth,allow("admin","A","B"),(req,res)=>{
+app.get("/api/history",auth,allow("admin"),(req,res)=>{
   const month=String(req.query.month||"");
   if(month&&!/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({error:"Mes no válido."});
   const params=[]; let where="";
@@ -318,11 +329,11 @@ app.get("/api/history",auth,allow("admin","A","B"),(req,res)=>{
     ${where} GROUP BY r.id ORDER BY r.requested_at DESC`,params);
   res.json(data);
 });
-app.get("/api/debts",auth,allow("admin","A","B"),(req,res)=>{
+app.get("/api/debts",auth,allow("admin"),(req,res)=>{
   const q=`%${req.query.q||""}%`;
   res.json(rows(`SELECT d.*,COALESCE(r.requester_name,u.full_name) full_name,COALESCE(r.requester_registration,u.registration) registration,i.name material,r.folio FROM debts d JOIN users u ON u.id=d.user_id JOIN inventory i ON i.id=d.inventory_id JOIN request_items ri ON ri.id=d.request_item_id JOIN requests r ON r.id=ri.request_id WHERE (COALESCE(r.requester_name,u.full_name) LIKE ? OR COALESCE(r.requester_registration,u.registration) LIKE ?) ORDER BY CASE WHEN d.status='entregado' THEN 3 WHEN d.due_date IS NOT NULL AND date(d.due_date)<date('now') THEN 1 ELSE 2 END,d.due_date`,[q,q]));
 });
-app.post("/api/debts/:id/delivered",auth,allow("admin","A"),(req,res)=>{
+app.post("/api/debts/:id/delivered",auth,allow("admin"),(req,res)=>{
   const d=one("SELECT * FROM debts WHERE id=? AND status='pendiente'",[req.params.id]);
   if(!d)return res.status(404).json({error:"Adeudo no encontrado o ya entregado."});
   tx(()=>{
@@ -331,7 +342,7 @@ app.post("/api/debts/:id/delivered",auth,allow("admin","A"),(req,res)=>{
   });
   res.json({message:"Adeudo marcado como entregado y material repuesto."});
 });
-app.get("/api/reports",auth,allow("admin","A"),(req,res)=>{
+app.get("/api/reports",auth,allow("admin"),(req,res)=>{
   const summary=one("SELECT COUNT(*) materials,COALESCE(SUM(quantity_total),0) units FROM inventory WHERE active=1");
   const byWarehouse=rows("SELECT warehouse,COUNT(*) materials,COALESCE(SUM(quantity_total),0) units FROM inventory GROUP BY warehouse ORDER BY warehouse");
   const topItems=rows("SELECT i.name, SUM(ri.quantity) total FROM request_items ri JOIN inventory i ON i.id=ri.inventory_id GROUP BY i.id ORDER BY total DESC LIMIT 10");
